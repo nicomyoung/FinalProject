@@ -7,19 +7,54 @@ import openai
 import os
 import json
 from transformers import pipeline
+#from sentence_transformers import SentenceTransformer
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from collections import defaultdict
 import matplotlib.pyplot as plt
+import mysql.connector
+from mysql.connector import Error
+from nltk import sent_tokenize
+import spacy
+from spacy.matcher import Matcher
+
+# WORK ON LOCAL SUMMARIZATION STUFF 
+# GET SOME TYPE OF QUALITATIVE RESPONSE
+# SHOW PARTICULAR OUTPUTS AND SPECIFICS
+# PUTTING TOGETHER A WRITE-UP FOR POTENTIAL EMPLOYERS
+# SOFTWARE DEVELOPER 
+# ASR DOMAIN GENERALIZATION - GENRE is RADIO BROADCASTERS - TRAIN MODEL ON NYT WOULDNT WORK ON WSJ 
+#   NOW ITS MORE ROBUST _ RADIO BROADCASTER IS NOT FRIENDS AT A RESTAURANT BACKGROUND NOISE, CLEAR SPEECH, ETC. CONVERSATION TOPIC CLIPS VS SCRIPTED KNOWLEDGE 
+
+
+nlp = spacy.load("en_core_web_sm")
+
+def db_connect():
+    try:
+        return mysql.connector.connect(
+            host='localhost',
+            database=os.getenv('MYSQL_DATABASE', 'chatr'),
+            user=os.getenv('MYSQL_USER'),
+            password=os.getenv('MYSQL_PASS'),
+        )
+    except Error as e:
+        print(f"Error connecting to MySQL database: {e}")
+        return None
+    
 
 openai.api_key_path = "C:\\Final Project\\api_key.txt"
 
-sentiment_analyzer = pipeline(
+cardinality_analyzer = pipeline(
     "sentiment-analysis",
     model="distilbert-base-uncased-finetuned-sst-2-english",
     tokenizer="distilbert-base-uncased-finetuned-sst-2-english"
 )
 
+
+emotion_classifier = pipeline(
+    task="text-classification",
+    model="SamLowe/roberta-base-go_emotions",
+    top_k=2)
 
 # Initialize the adaptive concurrency parameters
 INITIAL_CONCURRENT_REQUESTS = 10  # Starting conservative
@@ -58,8 +93,45 @@ class TextProcessor:
     def __init__(self, chunk_size=500):
         self.chunk_size = chunk_size
 
-    def chunk_text(self, text):
-        return [text[i:i+self.chunk_size] for i in range(0, len(text), self.chunk_size)]
+    def chunk_text(self, text, max_chunk_size=512):
+        """
+        This method creates chunks based on semantic similarity of sentences.
+        Sentences are embedded and then grouped together if they are semantically similar,
+        ensuring that chunks are as close to the max_chunk_size as possible without exceeding it.
+        """
+        # Tokenize the document into sentences
+        sentences = sent_tokenize(text)
+        sentence_embeddings = [nlp(sentence).vector for sentence in sentences]
+        
+        chunks = []
+        current_chunk = []
+        current_chunk_embedding = []
+        
+        for sentence, embedding in zip(sentences, sentence_embeddings):
+            # If adding the sentence doesn't exceed the max chunk size, or if the chunk is empty (ensure at least one sentence per chunk)
+            if len(current_chunk) == 0 or len(' '.join(current_chunk) + ' ' + sentence) <= max_chunk_size:
+                current_chunk.append(sentence)
+                current_chunk_embedding.append(embedding)
+            else:
+                # Compare the embedding of the current sentence to the average embedding of the current chunk
+                avg_chunk_embedding = np.mean(current_chunk_embedding, axis=0)
+                similarity = cosine_similarity([embedding], [avg_chunk_embedding])
+                
+                # If the sentence is semantically similar to the current chunk, add it to the current chunk
+                if similarity > 0.7:  # This threshold can be tuned
+                    current_chunk.append(sentence)
+                    current_chunk_embedding.append(embedding)
+                else:
+                    # Otherwise, start a new chunk
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = [sentence]
+                    current_chunk_embedding = [embedding]
+        
+        # Don't forget to add the last chunk
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
 
     def compute_similarity(self, chunks):
         vectorizer = TfidfVectorizer().fit_transform(chunks)
@@ -76,7 +148,7 @@ class TextProcessor:
     def summarize_chunk(self, chunk):
         try:
             messages = [
-                {"role": "system", "content": "You are a helpful assistant. Provide 2-3 concise bullet points summarizing the following."},
+                {"role": "system", "content": "You are a helpful assistant. Provide concise bullet points summarizing the following, limited to three bullet points maximum, each no longer than two sentences. Avoid sponsorship plugs."},
                 {"role": "user", "content": chunk}
             ]
             response = openai.ChatCompletion.create(
@@ -103,11 +175,53 @@ class TextProcessor:
         return response.choices[0].message['content'].strip()
 
     def get_sentiments(self, texts):
-        results = sentiment_analyzer(texts)
+        results = cardinality_analyzer(texts)
         sentiments = []
         for result in results:
             sentiments.append(result['score'] if result['label'] == 'POSITIVE' else -result['score'])
         return sentiments
+    
+    def extract_key_sentiments(self, text):
+        """
+        Analyze the sentiment of text, extracting the two most prominent emotions.
+        Returns a string of the two key emotions.
+        """
+        # Analyze the entire text using the emotion classifier
+        model_outputs = emotion_classifier(text)
+
+        # Check if there are at least two emotions detected
+        if len(model_outputs) > 0 and len(model_outputs[0]) >= 2:
+            # Extract labels from the first two dictionaries
+            first_emotion = model_outputs[0][0]["label"]
+            second_emotion = model_outputs[0][1]["label"]
+            return f'{first_emotion}, {second_emotion}'
+        else:
+            return model_outputs[0][0]["label"]
+
+
+
+    def extract_aspects(self, doc):
+        """
+        Extract key aspects or topics from the text using NLP techniques.
+        """
+        aspects = []
+        # Use spaCy's Matcher or Dependency Parser to extract aspects
+        # Example: Extracting nouns and compound nouns as aspects
+        for chunk in doc.noun_chunks:
+            aspects.append(chunk.text)
+        return aspects
+
+    def analyze_aspect_sentiments(self, aspects, text):
+        """
+        Analyze sentiment for each aspect extracted from the text.
+        """
+        aspect_sentiments = {}
+        for aspect in aspects:
+            # Refine sentiment analysis for each aspect using the new model
+            model_output = emotion_classifier(aspect)
+            aspect_sentiments[aspect] = model_output[0]
+        return aspect_sentiments
+
 
     def process(self, text):
         chunks = self.chunk_text(text)
@@ -134,53 +248,105 @@ class TextProcessor:
                     'summaries': summarized_texts,
                     'avg_sentiment': avg_sentiment
                 }
+        #print("Summarized Communities, ", summarized_communities)
 
         overall_sentiment = sum(sentiments.values()) / len(sentiments)
         return summarized_communities, overall_sentiment
     
-   
+
+
+
 
 class FileProcessor:
-    def __init__(self, input_dir, output_dir, num_files=None):
-        self.input_dir = input_dir
-        self.output_dir = output_dir
+   
+    def __init__(self, num_files=None):
         self.num_files = num_files
-        os.makedirs(output_dir, exist_ok=True)
         self.text_processor = TextProcessor()
 
-    def process_files(self):
-        files = [f for f in os.listdir(self.input_dir) if f.endswith('.json')]
-        limit = len(files) if not self.num_files else min(self.num_files, len(files))
-        
-        while files[:limit]:
-            with ThreadPoolExecutor(max_workers=adaptive_concurrency.get_concurrency_level()) as executor:
-                executor.map(self._process_single_file, files[:limit])
-            # slicing off the already processed files
-            files = files[adaptive_concurrency.get_concurrency_level():]
-
-
-    def _process_single_file(self, file_name):
+    def get_transcript(self):
+        connection = db_connect()
         try:
-            with open(os.path.join(self.input_dir, file_name), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                text = data[-1].get("complete", "") if isinstance(data, list) else ""
-                    
-            summarized_communities, overall_sentiment = self.text_processor.process(text)
-            
-            output_data = {
-                'file_name': file_name,
-                'overall_sentiment': overall_sentiment,
-                'topics': summarized_communities
-            }
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT t.id, t.file_name, t.transcription
+                FROM transcriptions t
+                LEFT JOIN summaries s ON t.file_name = s.file_name
+                WHERE s.id IS NULL
+            """)
+            return cursor.fetchall()
+        except mysql.connector.Error as e:
+            print(f"Error fetching transcriptions: {e}")
+        finally:
+            if connection:
+                connection.close()
 
-            output_file_name = os.path.join(self.output_dir, f"output_{file_name}")
-            with open(output_file_name, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, ensure_ascii=False, indent=4)
-                    
-        except Exception as e:
-            print(f"An error occurred while processing {file_name}: {e}")
+
+    def process_transcriptions(self):
+        transcriptions = self.get_transcript()
+        limit = len(transcriptions) if not self.num_files else min(self.num_files, len(transcriptions))
+        
+        # Using ThreadPoolExecutor to process in parallel
+        with ThreadPoolExecutor(max_workers=adaptive_concurrency.get_concurrency_level()) as executor:
+            for transcription in transcriptions[:limit]:
+                executor.submit(self._process_single_transcription, transcription)
+    
+    def _process_single_transcription(self, transcription):
+        file_name = transcription['file_name']
+        text = transcription['transcription']
+        print(f"Starting processing for file: {file_name}")
+
+        summarized_communities, overall_sentiment = self.text_processor.process(text)
+        summary_id = self.insert_summary(file_name, overall_sentiment)
+        #print("Summary ID: ", summary_id)
+
+        for title, details in summarized_communities.items():
+            #print("Title: ", title)
+            # Aggregate all bullet points into one text for sentiment analysis
+            full_text = ' '.join(details['summaries'])
+            key_sentiments = self.text_processor.extract_key_sentiments(full_text)
+            sentiment_score = details['avg_sentiment']
+            #print("Sentiment Score: ", sentiment_score)
+            #print("Key Sentiments: ", key_sentiments)
+            
+            # Process each bullet point for storage, but use the aggregated sentiment
+            for bullet_point in details['summaries']:
+                self.insert_summary_details(summary_id, title, bullet_point, sentiment_score, key_sentiments)
+        print(f"Finished processing file: {file_name}")
+
+    def insert_summary(self, file_name, overall_sentiment):
+        connection = db_connect()
+        try:
+            cursor = connection.cursor()
+            cursor.execute("""
+                INSERT INTO summaries (file_name, overall_sentiment)
+                VALUES (%s, %s)
+            """, (file_name, overall_sentiment))
+            connection.commit()
+            return cursor.lastrowid
+        except mysql.connector.Error as e:
+            print(f"Error while inserting summary: {e}")
+        finally:
+            if connection:
+                connection.close()
+
+    def insert_summary_details(self, summary_id, title, bullet_point, sentiment_score, key_sentiments):
+        connection = db_connect()
+        try:
+            cursor = connection.cursor()
+            cursor.execute("""
+                INSERT INTO summary_details (summary_id, title, bullet_point, sentiment_score, key_sentiments)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (summary_id, title, bullet_point, sentiment_score, key_sentiments))
+            connection.commit()
+        except mysql.connector.Error as e:
+            print(f"Error while inserting summary detail: {e}")
+        finally:
+            if connection:
+                connection.close()
+
+
 
 
 if __name__ == "__main__":
-    fp = FileProcessor("C:\\Final Project\\jsonTranscriptions", "C:\\Final Project\\jsonOutput", 5)
-    fp.process_files()
+    dp = FileProcessor(15)
+    dp.process_transcriptions()
