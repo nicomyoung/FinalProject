@@ -2,22 +2,22 @@ import os
 import json
 import openai
 from concurrent.futures import ThreadPoolExecutor
+import mysql.connector
+from mysql.connector import Error
 
 openai.api_key_path = "C:\\Final Project\\api_key.txt"
 
 class GenerativeAssistant:
 
-    def __init__(self, summary_path):
-        self.summary_path = summary_path
-        self.summaries = {}
+    def __init__(self, db_config):
+        self.db_config = db_config
 
-        # Check if the provided path is a directory or a single file
-        if os.path.isdir(summary_path):
-            self.files = [os.path.join(summary_path, f) for f in os.listdir(summary_path) if f.startswith('output_')]
-        elif os.path.isfile(summary_path):
-            self.files = [summary_path]
-        else:
-            raise ValueError(f"Provided path {summary_path} is neither a directory nor a file.")
+    def db_connect(self):
+        try:
+            return mysql.connector.connect(**self.db_config)
+        except Error as e:
+            print(f"Error connecting to MySQL database: {e}")
+            return None
 
     def generate_response(self, title, bullet_points):
         topic_content = f"{title}\n"
@@ -39,59 +39,104 @@ class GenerativeAssistant:
             print(f"An error occurred while generating response for title: {title}. Error: {e}")
             return (title, None)
 
-    def process_single_topic(self, title, bullet_points):
-        _, response = self.generate_response(title, bullet_points)
-        return response
+    def store_response(self, summary_detail_id, response):
+        connection = self.db_connect()
+        try:
+            cursor = connection.cursor()
+            query = "INSERT INTO generative_responses (summary_detail_id, response) VALUES (%s, %s)"
+            cursor.execute(query, (summary_detail_id, response))
+            connection.commit()
+        except Error as e:
+            print(f"Error while inserting generative response: {e}")
+        finally:
+            if connection:
+                connection.close()
 
-    def process_single_file(self, file_path):
-        responses = {}
-        
-        # Use ThreadPoolExecutor for concurrent processing of topics
-        with ThreadPoolExecutor() as executor:
-            future_to_title = {}
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+    def process_responses(self):
+        connection = self.db_connect()
+        try:
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute("SELECT id, title, bullet_point FROM summary_details")
+            summary_details = cursor.fetchall()
 
-                for title, details in data['topics'].items():
-                    bullet_points = details['summaries']
-                    future = executor.submit(self.generate_response, title, bullet_points[0])  # using the first summary for now
-                    future_to_title[future] = title
+            for detail in summary_details:
+                response = self.generate_response(detail['title'], [detail['bullet_point']])
+                if response:
+                    self.store_response(detail['id'], response[1])
+        except Error as e:
+            print(f"Error while fetching summary details: {e}")
+        finally:
+            if connection:
+                connection.close()
+    
+    def process_file(self, file_name):
+        connection = self.db_connect()
+        try:
+            cursor = connection.cursor(dictionary=True)
+            query = """
+                SELECT sd.id, sd.title, sd.bullet_point
+                FROM summary_details sd
+                JOIN summaries s ON sd.summary_id = s.id
+                WHERE s.file_name = %s
+            """
+            cursor.execute(query, (file_name,))
+            summary_details = cursor.fetchall()
 
-                for future in future_to_title:
-                    title, response = future.result()
-                    if response:
-                        responses[title] = response
-            except Exception as e:
-                print(f"An error occurred while processing summary file: {file_path}. Error: {e}")
+            for detail in summary_details:
+                response = self.generate_response(detail['title'], [detail['bullet_point']])
+                if response:
+                    self.store_response(detail['id'], response[1])
+        except Error as e:
+            print(f"Error while fetching summary details: {e}")
+        finally:
+            if connection:
+                connection.close()
+    
+    
+    def process_bullet_point(self, summary_detail_id):
+        connection = self.db_connect()
+        try:
+            cursor = connection.cursor(dictionary=True)
+            query = "SELECT title, bullet_point FROM summary_details WHERE id = %s"
+            cursor.execute(query, (summary_detail_id,))
+            detail = cursor.fetchone()
+            response = self.generate_response(detail['title'], [detail['bullet_point']])
+            if response:
+                self.store_response(summary_detail_id, response[1])
+        except Error as e:
+            print(f"Error while processing bullet point: {e}")
+        finally:
+            if connection:
+                connection.close()
 
-        return responses
+    def process_title(self, title):
+        connection = self.db_connect()
+        try:
+            cursor = connection.cursor(dictionary=True)
+            query = "SELECT id, bullet_point FROM summary_details WHERE title = %s"
+            cursor.execute(query, (title,))
+            details = cursor.fetchall()
+            bullet_points = [detail['bullet_point'] for detail in details]
+            response = self.generate_response(title, bullet_points)
+            if response:
+                for detail in details:
+                    self.store_response(detail['id'], response[1])
+        except Error as e:
+            print(f"Error while processing title: {e}")
+        finally:
+            if connection:
+                connection.close()
 
-    def process_all_files(self):
-        for file in self.files:
-            self.summaries[file] = self.process_single_file(file)
 
-    def display_responses(self):
-        for file, responses in self.summaries.items():
-            print(f"\nFile: {file}\n{'=' * 40}")
-            for title, response in responses.items():
-                print(f"Title: {title}")
-                print(f"Response: {response}\n")
+
 
 
 if __name__ == "__main__":
-    assistant = GenerativeAssistant("C:\\Final Project\\jsonOutput")
-
-    # Uncomment below for single topic analysis
-    # response = assistant.process_single_topic("Some Title", ["Point 1", "Point 2"])
-    # print(response)
-
-    # Uncomment below for single file analysis
-    responses = assistant.process_single_file("C:\\Final Project\\jsonOutput\\output_podcast_20230417_nprpolitics_c38035b4-0e7c-4160-882b-25dc3a90a82c.json")
-    for title, response in responses.items():
-        print(f"Title: {title}")
-        print(f"Response: {response}\n")
-
-    # Uncomment below for directory analysis (all files)
-    # assistant.process_all_files()
-    # assistant.display_responses()
+    db_config = {
+        host='localhost',
+            database=os.getenv('MYSQL_DATABASE', 'chatr'),
+            user=os.getenv('MYSQL_USER'),
+            password=os.getenv('MYSQL_PASS'),
+    }
+    assistant = GenerativeAssistant(db_config)
+    
