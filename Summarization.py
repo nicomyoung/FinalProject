@@ -6,7 +6,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import openai
 import os
 import json
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer
 #from sentence_transformers import SentenceTransformer
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -17,16 +17,6 @@ from mysql.connector import Error
 from nltk import sent_tokenize
 import spacy
 from spacy.matcher import Matcher
-
-# WORK ON LOCAL SUMMARIZATION STUFF 
-# GET SOME TYPE OF QUALITATIVE RESPONSE
-# SHOW PARTICULAR OUTPUTS AND SPECIFICS
-# PUTTING TOGETHER A WRITE-UP FOR POTENTIAL EMPLOYERS
-# SOFTWARE DEVELOPER 
-# ASR DOMAIN GENERALIZATION - GENRE is RADIO BROADCASTERS - TRAIN MODEL ON NYT WOULDNT WORK ON WSJ 
-#   NOW ITS MORE ROBUST _ RADIO BROADCASTER IS NOT FRIENDS AT A RESTAURANT BACKGROUND NOISE, CLEAR SPEECH, ETC. CONVERSATION TOPIC CLIPS VS SCRIPTED KNOWLEDGE 
-
-
 nlp = spacy.load("en_core_web_sm")
 
 def db_connect():
@@ -87,50 +77,45 @@ class AdaptiveConcurrency:
 adaptive_concurrency = AdaptiveConcurrency()
 
 
-
-
 class TextProcessor:
-    def __init__(self, chunk_size=500):
+    def __init__(self, chunk_size=512):
         self.chunk_size = chunk_size
+        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-    def chunk_text(self, text, max_chunk_size=512):
-        """
-        This method creates chunks based on semantic similarity of sentences.
-        Sentences are embedded and then grouped together if they are semantically similar,
-        ensuring that chunks are as close to the max_chunk_size as possible without exceeding it.
-        """
-        # Tokenize the document into sentences
+    def chunk_text(self, text):
         sentences = sent_tokenize(text)
         sentence_embeddings = [nlp(sentence).vector for sentence in sentences]
-        
+
         chunks = []
         current_chunk = []
         current_chunk_embedding = []
-        
+        current_chunk_token_count = 0
+
         for sentence, embedding in zip(sentences, sentence_embeddings):
-            # If adding the sentence doesn't exceed the max chunk size, or if the chunk is empty (ensure at least one sentence per chunk)
-            if len(current_chunk) == 0 or len(' '.join(current_chunk) + ' ' + sentence) <= max_chunk_size:
+            sentence_tokens = self.tokenizer.tokenize(sentence)
+            sentence_token_count = len(sentence_tokens)
+
+            # Skip the sentence if it's too long by itself
+            if sentence_token_count > self.chunk_size:
+                continue
+
+            # Check if adding the sentence exceeds the max chunk size
+            if current_chunk_token_count + sentence_token_count <= self.chunk_size:
                 current_chunk.append(sentence)
                 current_chunk_embedding.append(embedding)
+                current_chunk_token_count += sentence_token_count
             else:
-                # Compare the embedding of the current sentence to the average embedding of the current chunk
-                avg_chunk_embedding = np.mean(current_chunk_embedding, axis=0)
-                similarity = cosine_similarity([embedding], [avg_chunk_embedding])
-                
-                # If the sentence is semantically similar to the current chunk, add it to the current chunk
-                if similarity > 0.7:  # This threshold can be tuned
-                    current_chunk.append(sentence)
-                    current_chunk_embedding.append(embedding)
-                else:
-                    # Otherwise, start a new chunk
-                    chunks.append(' '.join(current_chunk))
-                    current_chunk = [sentence]
-                    current_chunk_embedding = [embedding]
-        
-        # Don't forget to add the last chunk
+                # Add the current chunk to the chunks list
+                chunks.append(' '.join(current_chunk))
+                # Start a new chunk with the current sentence
+                current_chunk = [sentence]
+                current_chunk_embedding = [embedding]
+                current_chunk_token_count = sentence_token_count
+
+        # Add the last chunk if it's not empty
         if current_chunk:
             chunks.append(' '.join(current_chunk))
-        
+
         return chunks
 
     def compute_similarity(self, chunks):
@@ -147,8 +132,9 @@ class TextProcessor:
     @lru_cache(maxsize=1000)
     def summarize_chunk(self, chunk):
         try:
+            prompt_message = "Bullet Point Summary:\n- [Bullet 1]:\n- [Bullet 2]:\n- [Bullet 3]:\nSummarize the following text in three concise bullet points as indicated, focusing on the key points, in a tone matching the original text. Each bullet point should be no more than two sentences and avoid any form of promotional content. Text to summarize: "
             messages = [
-                {"role": "system", "content": "You are a helpful assistant. Provide concise bullet points summarizing the following, limited to three bullet points maximum, each no longer than two sentences. Avoid sponsorship plugs."},
+                {"role": "system", "content": prompt_message},
                 {"role": "user", "content": chunk}
             ]
             response = openai.ChatCompletion.create(
@@ -156,6 +142,7 @@ class TextProcessor:
                 messages=messages
             )
             adaptive_concurrency.successful_request()  # No rate-limit error, count the success
+            # Post-process here if necessary
             return response.choices[0].message['content'].strip()
 
         except openai.error.OpenAIError as e:
@@ -163,11 +150,14 @@ class TextProcessor:
                 adaptive_concurrency.encountered_rate_limit_error()
             raise e
 
+
     @lru_cache(maxsize=1000)
     def generate_title(self, chunks):
-        concatenated_text = ' '.join(chunks)
-        messages = [{"role": "system", "content": "You are a helpful assistant. Provide a title for the following content."},
-                    {"role": "user", "content": concatenated_text}]
+        #print("chunks: ", chunks)
+        #concatenated_text = ' '.join(chunks)
+       # print("concatenated_text: ", concatenated_text)
+        messages = [{"role": "system", "content": "You are a helpful assistant. Provide a 1 sentence or shorter title for the following text: "},
+                    {"role": "user", "content": chunks}]
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=messages
@@ -237,13 +227,15 @@ class TextProcessor:
         with ThreadPoolExecutor() as executor:
             for community_id, community_chunks in communities.items():
                 summarized_texts = list(executor.map(self.summarize_chunk, community_chunks))
-                titles = list(executor.map(self.generate_title, community_chunks))
+                #titles = list(executor.map(self.generate_title, community_chunks))
+                concatenated_summaries = ' '.join(summarized_texts)
+                title = self.generate_title(concatenated_summaries)
 
                 sentiment_scores = self.get_sentiments(summarized_texts)
                 avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
                 sentiments[community_id] = avg_sentiment
                 
-                title = titles[0]
+                #title = titles[0]
                 summarized_communities[title] = {
                     'summaries': summarized_texts,
                     'avg_sentiment': avg_sentiment
@@ -280,6 +272,23 @@ class FileProcessor:
             if connection:
                 connection.close()
 
+    def get_transcript_by_filename(self, file_name):
+        connection = db_connect()
+        try:
+            with connection.cursor(dictionary=True) as cursor:
+                cursor.execute("""
+                    SELECT t.id, t.file_name, t.transcription
+                    FROM transcriptions t
+                    WHERE t.file_name = %s
+                """, (file_name,))
+                return cursor.fetchone()
+        except mysql.connector.Error as e:
+            print(f"Error fetching transcription for file {file_name}: {e}")
+        finally:
+            if connection:
+                connection.close()
+
+
 
     def process_transcriptions(self):
         transcriptions = self.get_transcript()
@@ -290,6 +299,7 @@ class FileProcessor:
             for transcription in transcriptions[:limit]:
                 executor.submit(self._process_single_transcription, transcription)
     
+
     def _process_single_transcription(self, transcription):
         file_name = transcription['file_name']
         text = transcription['transcription']
@@ -297,21 +307,35 @@ class FileProcessor:
 
         summarized_communities, overall_sentiment = self.text_processor.process(text)
         summary_id = self.insert_summary(file_name, overall_sentiment)
-        #print("Summary ID: ", summary_id)
+        
 
         for title, details in summarized_communities.items():
-            #print("Title: ", title)
-            # Aggregate all bullet points into one text for sentiment analysis
+            print("title: ", title)
+            print("details: ", details)
             full_text = ' '.join(details['summaries'])
             key_sentiments = self.text_processor.extract_key_sentiments(full_text)
             sentiment_score = details['avg_sentiment']
-            #print("Sentiment Score: ", sentiment_score)
-            #print("Key Sentiments: ", key_sentiments)
-            
-            # Process each bullet point for storage, but use the aggregated sentiment
+
             for bullet_point in details['summaries']:
-                self.insert_summary_details(summary_id, title, bullet_point, sentiment_score, key_sentiments)
+                # Split the text into separate bullet points based on newlines
+                bullets = bullet_point.split('\n')
+                for bullet in bullets:
+                    if bullet:  # Ensure it's not an empty string
+                        self.insert_summary_details(summary_id, title, bullet, sentiment_score, key_sentiments)
+
         print(f"Finished processing file: {file_name}")
+        return overall_sentiment, summary_id
+
+   
+    def process_single_file(self, file_name):
+        transcription = self.get_transcript_by_filename(file_name)
+        if transcription:
+            summary_id = self._process_single_transcription(transcription)[1]
+            return summary_id
+        else:
+            print(f"No transcription found for file: {file_name}")
+            return None
+
 
     def insert_summary(self, file_name, overall_sentiment):
         connection = db_connect()
